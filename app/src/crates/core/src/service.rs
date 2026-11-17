@@ -25,6 +25,14 @@ use crate::stream::{self, SourceRequest, StreamInfo, StreamRequest, StreamState}
 const CONTROLLER_PROBE: Duration = Duration::from_secs(2);
 /// Time for a USB adapter to come back after resume before it is opened
 const RESUME_SETTLE: Duration = Duration::from_secs(3);
+/// How long after the resume the adapter may still be off the bus: Windows
+/// re-enumerates the USB port while its power comes back, and an adapter
+/// opened before its descriptors answer stays wedged (a controller came back
+/// from S3 silent and only a power cycle brought it back)
+const RESUME_ADAPTER_WAIT: Duration = Duration::from_secs(30);
+/// How often the adapter is looked for after the resume, and while a
+/// session waits for it to come back before connecting
+const ADAPTER_POLL: Duration = Duration::from_secs(2);
 /// Waiting for the resume after the adapter went away for sleep: ticks of
 /// [`RESUME_TICK`], so about a minute while the PC stays awake (a wait across
 /// sleep ends once on wake, whatever the clock says)
@@ -529,18 +537,84 @@ impl Inner {
     fn wait_after_resume(&self) {
         let Some(at) = self.power.resumed_at() else { return };
         let since = at.elapsed();
-        if since >= RESUME_SETTLE {
-            return;
+        if since < RESUME_SETTLE {
+            tracing::info!("waiting {} ms for the adapter after resume", (RESUME_SETTLE - since).as_millis());
+            while at.elapsed() < RESUME_SETTLE && !self.stop_requested() {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            tracing::debug!(
+                "resume settle: done {} ms after the resume (stop requested {})",
+                at.elapsed().as_millis(),
+                self.stop_requested()
+            );
         }
-        tracing::info!("waiting {} ms for the adapter after resume", (RESUME_SETTLE - since).as_millis());
-        while at.elapsed() < RESUME_SETTLE && !self.stop_requested() {
-            std::thread::sleep(Duration::from_millis(100));
+        // The port gets its power back with the PC: until Windows has
+        // enumerated the adapter, opening it yields a controller that
+        // answers nothing (S3 left a controller silent that way, and only
+        // a power cycle brought it back)
+        if self.wait_for_adapter(RESUME_ADAPTER_WAIT) {
+            tracing::info!("the adapter is back on the bus {} ms after the resume", at.elapsed().as_millis());
         }
-        tracing::debug!(
-            "resume settle: done {} ms after the resume (stop requested {})",
-            at.elapsed().as_millis(),
-            self.stop_requested()
-        );
+    }
+
+    /// The adapter the next stack would open is on the bus with a working
+    /// driver: not one Windows failed to start (a wedged controller shows
+    /// a problem code)
+    pub(crate) fn adapter_on_bus(&self) -> bool {
+        let Ok(devices) = win_sys::usb_adapters::enumerate(false) else {
+            tracing::debug!("cannot enumerate the USB devices");
+            return false;
+        };
+        devices.iter().any(|d| {
+            if d.problem_code.is_some() {
+                return false;
+            }
+            match (&self.opts.usb.instance_id, self.opts.usb.vid_pid) {
+                (Some(id), _) => d.instance_id.eq_ignore_ascii_case(id),
+                (None, Some((vid, pid))) => d.vid == vid && d.pid == pid,
+                (None, None) => d.looks_like_bluetooth(),
+            }
+        })
+    }
+
+    /// Waits for the adapter to be on the bus with a working driver, in
+    /// [`ADAPTER_POLL`] steps; false when `max` passed or the session was
+    /// stopped. Connection attempts wait for this, not for a timer: an
+    /// adapter absent after a resume is one Windows is still enumerating,
+    /// and one opened then answers nothing.
+    pub(crate) fn wait_for_adapter(&self, max: Duration) -> bool {
+        let start = Instant::now();
+        let mut said = 0u64;
+        loop {
+            if self.adapter_on_bus() {
+                tracing::info!("the adapter is on the bus ({} ms after the wait started)", start.elapsed().as_millis());
+                return true;
+            }
+            if self.stop_requested() {
+                return false;
+            }
+            if start.elapsed() >= max {
+                tracing::warn!("the adapter did not come back within {} s", max.as_secs());
+                return false;
+            }
+            if said == 0 || start.elapsed().as_secs() / 30 > said {
+                said = start.elapsed().as_secs() / 30;
+                tracing::info!("waiting for the adapter to come back on the bus");
+            }
+            // Reacts to a stop within the step
+            self.wait_tick(ADAPTER_POLL);
+        }
+    }
+
+    /// After a resume no link is there any more: the headphones may be off,
+    /// on another device or out of range. Nothing stays "connected" or
+    /// "waiting", so the next connection starts from scratch.
+    pub(crate) fn forget_links_after_resume(&self) {
+        tracing::info!("the PC resumed: every device is disconnected, they connect again when they are back");
+        self.streamed.store(false, Ordering::Release);
+        self.turned_off.store(false, Ordering::Release);
+        self.waiting.store(false, Ordering::Release);
+        self.le_stream.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 
     /// LE Audio for the next stack: the setting in developer mode

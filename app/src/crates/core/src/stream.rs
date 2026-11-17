@@ -948,6 +948,9 @@ const RESTART_ATTEMPTS: u32 = 10;
 /// A link that faded (out of range) on a working stack: headphones that do
 /// not answer three pages are not about to (turned off ones are not retried)
 const LINK_LOSS_ATTEMPTS: u32 = 3;
+/// How long a session waits for the adapter itself (USB enumeration after a
+/// resume, a re-plug) before giving up: no connection attempt is spent on it
+const RECONNECT_ADAPTER_WAIT: Duration = Duration::from_secs(300);
 
 fn reconnect_attempts(restarted: bool) -> u32 {
     if restarted { RESTART_ATTEMPTS } else { LINK_LOSS_ATTEMPTS }
@@ -1057,6 +1060,12 @@ fn is_saved(inner: &Inner, addr: [u8; 6]) -> bool {
 /// media sink belongs to it) and the session waits for the resume. Returns
 /// why the stack is then started anew, None when the session was stopped.
 fn sleep_through(inner: &Inner, pipeline: &mut Option<Pipeline>) -> Option<&'static str> {
+    // The resume may come between the link check and here: then the adapter
+    // is back already and the stack is restarted instead of being torn down
+    if !inner.power.suspending() {
+        tracing::debug!("sleep: no longer suspending, the stack is restarted");
+        return Some(RESUMED);
+    }
     tracing::info!("the PC is going to sleep, reconnecting after it resumes");
     if let Some(p) = pipeline.take() {
         let _ = p.stop();
@@ -1065,6 +1074,16 @@ fn sleep_through(inner: &Inner, pipeline: &mut Option<Pipeline>) -> Option<&'sta
     let t = Instant::now();
     if !inner.wait_for_resume() {
         tracing::debug!("sleep: stopped while waiting for the resume");
+        return None;
+    }
+    // Nothing survives a resume: the headphones may be off, on another
+    // device or out of range. Every device counts as disconnected and
+    // connects again from scratch, and the adapter itself is waited for in
+    // 2 s steps before anything is allowed to connect (an adapter opened
+    // while Windows enumerates it answers nothing)
+    inner.forget_links_after_resume();
+    if !inner.wait_for_adapter(Duration::from_secs(120)) {
+        tracing::warn!("sleep: no adapter after the resume, the session ends");
         return None;
     }
     tracing::debug!("sleep: resumed after {} s, stack stale {}", t.elapsed().as_secs(), inner.power.stale());
@@ -2346,6 +2365,13 @@ pub(crate) fn run(inner: &Arc<Inner>, req: StreamRequest) {
                 let Some(why) = sleep_through(inner, &mut pipeline) else { break };
                 tracing::info!("{why}, reconnecting");
                 restart_why = Some(why);
+            }
+            // The adapter itself may be away (a long sleep, a USB re-plug):
+            // no attempt is spent on it, and nothing connects before it is on
+            // the bus with a working driver
+            if !inner.adapter_on_bus() && !inner.wait_for_adapter(RECONNECT_ADAPTER_WAIT) {
+                tracing::warn!("reconnect: the adapter did not come back, giving up");
+                break;
             }
             restarted |= restart_why.is_some();
             let attempts = reconnect_attempts(restarted);
