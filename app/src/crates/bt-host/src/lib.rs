@@ -2102,6 +2102,10 @@ impl BtHost {
         let Some(thread) = self.thread.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
         if lost {
             tracing::info!("the Bluetooth adapter went away, closing it without HCI power off");
+            // The close runs after the resume, while the port is still coming
+            // up: an HCI Reset then reaches a controller without firmware and
+            // leaves it silent (the adapter had to be power cycled)
+            hci_transport::skip_close_reset(true);
         } else {
             self.power_off();
         }

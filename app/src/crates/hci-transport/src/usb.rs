@@ -147,6 +147,19 @@ const SCO_OUT_SLOT_LEN: usize = 3 + 255;
 /// Consecutive failed SCO reads after which the thread logs a warning
 const SCO_IN_WARN_ERRORS: u32 = 50;
 
+/// The adapter is going away with the PC's power (sleep): the close must
+/// not send HCI Reset. On resume the close runs while the port is still
+/// coming up, the reset reaches a controller that has no firmware running
+/// yet, and it stays silent afterwards (every command timed out until the
+/// adapter was power cycled). Set by bt-host's `shutdown_lost`, taken by
+/// the next close.
+static SKIP_CLOSE_RESET: AtomicBool = AtomicBool::new(false);
+
+/// Tells the next transport close that the adapter went away with the PC
+pub fn skip_close_reset(on: bool) {
+    SKIP_CLOSE_RESET.store(on, Ordering::Release);
+}
+
 /// The writer slot of an outgoing packet: 0 commands (control pipe), 1 ACL
 /// and ISO data (bulk OUT pipe), 2 SCO data (isochronous OUT pipe of
 /// interface 1). BTstack sends one command at a time; ACL and ISO packets
@@ -1427,9 +1440,13 @@ impl HciBackend for UsbTransport {
         tracing::debug!("USB: I/O threads stopped in {:?}", started.elapsed());
         // Leave the controller idle (no links, no scans, no queued events)
         // for the next session, as Linux does with HCI_QUIRK_RESET_ON_CLOSE;
-        // not a bootloader (module docs)
+        // not a bootloader (module docs), and not an adapter that went away
+        // with the PC's power: that reset would reach a port still coming up
+        let skip = SKIP_CLOSE_RESET.swap(false, Ordering::AcqRel);
         if opened.bootloader.load(Ordering::Acquire) {
             tracing::info!(target: "hci", "USB: controller in its bootloader, no HCI Reset on close");
+        } else if skip {
+            tracing::info!(target: "hci", "USB: the adapter went away with the PC, no HCI Reset on close");
         } else {
             match send_command(&opened.interface, &[0x03, 0x0C, 0x00], CLOSE_RESET_TIMEOUT) {
                 Ok(()) => {

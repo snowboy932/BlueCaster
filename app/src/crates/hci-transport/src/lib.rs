@@ -15,7 +15,7 @@ pub mod tcp;
 pub mod usb;
 
 pub use tcp::TcpH4;
-pub use usb::{UsbCandidate, UsbSelector, UsbTransport};
+pub use usb::{UsbCandidate, UsbSelector, UsbTransport, skip_close_reset};
 
 /// The USB ACL writer raises its priority (MMCSS "Pro Audio" on Windows,
 /// as the encode thread) through a hook core installs, so this crate stays
