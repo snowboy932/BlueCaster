@@ -585,8 +585,12 @@ impl HostApp {
             None => stack.set_link_key_store(None),
         }
         // Audio (major 0x04), Hi-Fi audio device (minor 0x28), A2DP source;
-        // page timeout ~20 s (0x8000 * 0.625 ms)
-        stack.gap_setup(0x200428, 0x8000, &self.setup.local_name);
+        // page timeout 5.12 s (0x2000 * 0.625 ms), the HCI default. A page
+        // that misses the headphones' scan window then costs 5 s instead of
+        // 20 (0x8000): a headset answered 14 s into the second page after the
+        // first one timed out at 20 s, and the shorter timeout gives the
+        // attempts more rolls of the dice in the same time.
+        stack.gap_setup(0x200428, 0x2000, &self.setup.local_name);
         // L2CAP before any profile: it registers with HCI for Connection
         // Complete events
         stack.l2cap_init();
